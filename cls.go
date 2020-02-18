@@ -3,6 +3,7 @@ package cls
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -175,36 +176,53 @@ func (p *LogService) Upload(topicID string, l *LogGroupList, compress, hash bool
 }
 
 // Search 用于搜索日志，最多 10000 条。
-func (p *LogService) Search(w io.Writer, logsetID string, topicIDs []string, startTime, endTime time.Time, query string, limit int, context string, desc bool) ([]string, error) {
-	requestIDs := make([]string, 0)
+func (p *LogService) Search(ctx context.Context, w io.Writer, logsetID string, topicIDs []string, startTime, endTime time.Time, query string, limit int, context string, desc bool) ([]string, error) {
+	// TODO: 参数校验
+	if limit <= 0 {
+		return nil, fmt.Errorf("invalid param")
+	}
 
+	requestIDs := make([]string, 0)
 	contextTemp := context
+	limitTemp := 0
+	cnt := 0
 	sort := "desc"
 	if !desc {
 		sort = "asc"
 	}
 
 	for {
-		requestID, searchResp, err := p.search(logsetID, topicIDs, startTime, endTime, query, limit, contextTemp, sort)
-		requestIDs = append(requestIDs, requestID)
-		if err != nil {
-			return requestIDs, zerr.Wrap(err)
-		}
-
-		contextTemp = searchResp.Context
-
-		for _, r := range searchResp.Results {
-			_, err := w.Write([]byte(r.Content))
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("search context canceled")
+		default:
+			if limit-cnt >= 100 {
+				limitTemp = 100
+			} else {
+				limitTemp = limit
+			}
+			requestID, searchResp, err := p.search(logsetID, topicIDs, startTime, endTime, query, limitTemp, contextTemp, sort)
+			requestIDs = append(requestIDs, requestID)
 			if err != nil {
 				return requestIDs, zerr.Wrap(err)
 			}
-		}
-		if searchResp.Listover {
-			break
+			contextTemp = searchResp.Context
+
+			for _, r := range searchResp.Results {
+				_, err := w.Write([]byte(r.Content))
+				if err != nil {
+					return requestIDs, zerr.Wrap(err)
+				}
+				cnt++
+				if cnt >= limit {
+					return requestIDs, nil
+				}
+			}
+			if searchResp.Listover {
+				return requestIDs, nil
+			}
 		}
 	}
-
-	return requestIDs, nil
 }
 
 func (p *LogService) search(logsetID string, topicIDs []string, startTime, endTime time.Time, query string, limit int, context, sort string) (string, SearchResponse, error) {

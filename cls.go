@@ -199,7 +199,7 @@ func (p *LogService) Search(ctx context.Context, w io.Writer, logsetID string, t
 			if limit-cnt >= 100 {
 				limitTemp = 100
 			} else {
-				limitTemp = limit
+				limitTemp = limit - cnt
 			}
 			requestID, searchResp, err := p.search(logsetID, topicIDs, startTime, endTime, query, limitTemp, contextTemp, sort)
 			requestIDs = append(requestIDs, requestID)

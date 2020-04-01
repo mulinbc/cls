@@ -209,7 +209,12 @@ func (p *LogService) Search(ctx context.Context, w io.Writer, logsetID string, t
 			contextTemp = searchResp.Context
 
 			for _, r := range searchResp.Results {
-				_, err := w.Write([]byte(r.Content))
+				// CLS 接口返回数据不一致，无换行时添加换行符('\n')！！
+				c := r.Content
+				if !strings.HasSuffix(c, "\n") {
+					c = c + "\n"
+				}
+				_, err := w.Write([]byte(c))
 				if err != nil {
 					return requestIDs, zerr.Wrap(err)
 				}

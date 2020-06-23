@@ -29,13 +29,14 @@ type Client struct {
 	SecretID      string        `validate:"required"`
 	SecretKey     string        `validate:"required"`
 	Scheme        string        `validate:"oneof=http https"`
-	Host          string        `validate:"hostname"`
+	Host          string        `validate:"fqdn"`
 	SignAlgorithm string        `validate:"oneof=sha1"`
 	CompressType  string        `validate:"oneof=lz4"`
 	Expire        time.Duration `validate:"required"`
 
-	client *http.Client
-	common service
+	validate *validator.Validate
+	client   *http.Client
+	common   service
 
 	Log *LogService
 }
@@ -44,22 +45,36 @@ type service struct {
 	client *Client
 }
 
-// SearchResponse 表示 CLS 搜索日志 API 响应信息。
-type SearchResponse struct {
-	Context  string      `json:"context"`
-	Listover bool        `json:"listover"`
-	Results  []LogObject `json:"results"`
-	SQLFlag  bool        `json:"sql_flag"`
+// SearchReq 表示 CLS 搜索日志 API 请求参数。
+type SearchReq struct {
+	LogSetID  string    `validate:"required"`
+	TopicIDs  []string  `validate:"required"`
+	StartTime time.Time `validate:"required"`
+	EndTime   time.Time `validate:"required"`
+	Query     string    `validate:"omitempty"`
+	Limit     int       `validate:"min=1,max=100"`
+	Context   string    `validate:"omitempty"`
+	Sort      string    `validate:"omitempty,oneof=asc desc"`
+}
+
+// SearchResp 表示 CLS 搜索日志 API 响应参数。
+type SearchResp struct {
+	Context   string      `json:"context"`
+	Listover  bool        `json:"listover"`
+	Results   []LogObject `json:"results"`
+	SQLFlag   bool        `json:"sql_flag"`
+	RequestID string      `json:"-"`
+	Error     *ErrorInfo  `json:"-"`
 }
 
 // LogObject 表示日志内容信息。
 type LogObject struct {
-	TopicID   string `json:"topic_id"`
-	TopicName string `json:"topic_name"`
-	Timestamp string `json:"timestamp"`
 	Content   string `json:"content"`
 	Filename  string `json:"filename"`
 	Source    string `json:"source"`
+	Timestamp string `json:"timestamp"`
+	TopicID   string `json:"topic_id"`
+	TopicName string `json:"topic_name"`
 }
 
 // ErrorInfo 表示 CLS API 返回的错误信息。
@@ -78,6 +93,7 @@ func NewClient(httpClient *http.Client, secretID, secretKey, scheme, host, signA
 		SignAlgorithm: signAlgorithm,
 		CompressType:  compressType,
 		Expire:        expire,
+		validate:      validator.New(),
 	}
 
 	c.client = httpClient
@@ -85,7 +101,7 @@ func NewClient(httpClient *http.Client, secretID, secretKey, scheme, host, signA
 
 	c.Log = (*LogService)(&c.common)
 
-	if err := validator.New().Struct(c); err != nil {
+	if err := c.validate.Struct(c); err != nil {
 		return nil, zerr.Wrap(err)
 	}
 
@@ -175,34 +191,49 @@ func (p *LogService) Upload(topicID string, l *LogGroupList, compress, hash bool
 	return requestID, nil
 }
 
-// Search 用于搜索日志，最多 10000 条。
-func (p *LogService) Search(ctx context.Context, w io.Writer, logsetID string, topicIDs []string, startTime, endTime time.Time, query string, limit int, context string, desc bool) ([]string, error) {
-	// TODO: 参数校验
-	if limit <= 0 {
-		return nil, fmt.Errorf("invalid param")
+// Search 用于搜索日志，单次返回的最大条数为100。
+func (p *LogService) Search(searchReq SearchReq) (SearchResp, error) {
+	resp, err := p.SearchWithContext(context.Background(), searchReq)
+	if err != nil {
+		return SearchResp{}, zerr.Wrap(err)
 	}
 
+	return resp, nil
+}
+
+// SearchWithContext 用于搜索日志，通过 context 控制生命周期，单次返回的最大条数为100。
+func (p *LogService) SearchWithContext(ctx context.Context, searchReq SearchReq) (SearchResp, error) {
+	if err := p.client.validate.Struct(searchReq); err != nil {
+		return SearchResp{}, zerr.Wrap(err)
+	}
+
+	resp, err := p.searchWithContext(ctx, searchReq)
+	if err != nil {
+		return SearchResp{}, zerr.Wrap(err)
+	}
+
+	return resp, nil
+}
+
+// SearchAll 用于搜索日志，最多 10000 条。
+func (p *LogService) SearchAll(ctx context.Context, w io.Writer, searchReq SearchReq) ([]string, error) {
 	requestIDs := make([]string, 0)
-	contextTemp := context
+	contextTemp := searchReq.Context
 	limitTemp := 0
 	cnt := 0
-	sort := "desc"
-	if !desc {
-		sort = "asc"
-	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("search context canceled")
+			return nil, zerr.Wrap(fmt.Errorf("context canceled"))
 		default:
-			if limit-cnt >= 100 {
+			if searchReq.Limit-cnt >= 100 {
 				limitTemp = 100
 			} else {
-				limitTemp = limit - cnt
+				limitTemp = searchReq.Limit - cnt
 			}
-			requestID, searchResp, err := p.search(logsetID, topicIDs, startTime, endTime, query, limitTemp, contextTemp, sort)
-			requestIDs = append(requestIDs, requestID)
+			searchResp, err := p.searchWithContext(ctx, SearchReq{searchReq.LogSetID, searchReq.TopicIDs, searchReq.StartTime, searchReq.EndTime, searchReq.Query, limitTemp, contextTemp, searchReq.Sort})
+			requestIDs = append(requestIDs, searchResp.RequestID)
 			if err != nil {
 				return requestIDs, zerr.Wrap(err)
 			}
@@ -219,7 +250,7 @@ func (p *LogService) Search(ctx context.Context, w io.Writer, logsetID string, t
 					return requestIDs, zerr.Wrap(err)
 				}
 				cnt++
-				if cnt >= limit {
+				if cnt >= searchReq.Limit {
 					return requestIDs, nil
 				}
 			}
@@ -230,28 +261,32 @@ func (p *LogService) Search(ctx context.Context, w io.Writer, logsetID string, t
 	}
 }
 
-func (p *LogService) search(logsetID string, topicIDs []string, startTime, endTime time.Time, query string, limit int, context, sort string) (string, SearchResponse, error) {
-	searchResp := SearchResponse{}
+func (p *LogService) searchWithContext(ctx context.Context, searchReq SearchReq) (SearchResp, error) {
+	searchResp := SearchResp{}
 
-	q := url.Values{}
-	q.Add("logset_id", logsetID)
-	q.Add("topic_ids", strings.Join(topicIDs, ","))
-	q.Add("start_time", startTime.Format(timeLayout))
-	q.Add("end_time", endTime.Format(timeLayout))
-	q.Add("query", query)
-	q.Add("limit", strconv.Itoa(limit))
-	q.Add("context", context)
-	q.Add("sort", sort)
+	v := url.Values{}
+	v.Set("logset_id", searchReq.LogSetID)
+	v.Set("topic_ids", strings.Join(searchReq.TopicIDs, ","))
+	v.Set("start_time", searchReq.StartTime.Format(timeLayout))
+	v.Set("end_time", searchReq.EndTime.Format(timeLayout))
+	v.Set("query", searchReq.Query)
+	v.Set("limit", strconv.Itoa(searchReq.Limit))
+	if searchReq.Context != "" {
+		v.Set("context", searchReq.Context)
+	}
+	if searchReq.Sort != "" {
+		v.Set("sort", searchReq.Sort)
+	}
 	u := url.URL{
 		Scheme:   p.client.Scheme,
 		Host:     p.client.Host,
 		Path:     "searchlog",
-		RawQuery: q.Encode(),
+		RawQuery: v.Encode(),
 	}
 
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", searchResp, zerr.Wrap(err)
+		return searchResp, zerr.Wrap(err)
 	}
 	req.Header.Set("Host", p.client.Host)
 	req.Header.Set("Content-Type", "application/x-protobuf")
@@ -260,30 +295,30 @@ func (p *LogService) search(logsetID string, topicIDs []string, startTime, endTi
 
 	resp, err := p.client.client.Do(req)
 	if err != nil {
-		return "", searchResp, zerr.Wrap(err)
+		return searchResp, zerr.Wrap(err)
 	}
 	defer resp.Body.Close()
 
-	requestID := resp.Header.Get("x-cls-requestid")
-
+	searchResp.RequestID = resp.Header.Get("x-cls-requestid")
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return requestID, searchResp, zerr.Wrap(err)
+		return searchResp, zerr.Wrap(err)
 	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
-		e := ErrorInfo{}
-		if err := json.Unmarshal(b, &e); err != nil {
-			return requestID, searchResp, zerr.Wrap(err)
+		errorInfo := &ErrorInfo{}
+		if err := json.Unmarshal(b, errorInfo); err != nil {
+			return searchResp, zerr.Wrap(err)
 		}
-		return requestID, searchResp, zerr.Wrap(fmt.Errorf("%s: %s", e.ErrorCode, e.ErrorMessage))
+		searchResp.Error = errorInfo
+		return searchResp, zerr.Wrap(fmt.Errorf("search failed, status code is %d, error code is \"%s\", error message is \"%s\"", resp.StatusCode, errorInfo.ErrorCode, errorInfo.ErrorMessage))
 	}
 
 	if err := json.Unmarshal(b, &searchResp); err != nil {
-		return requestID, searchResp, zerr.Wrap(err)
+		return searchResp, zerr.Wrap(err)
 	}
 
-	return requestID, searchResp, nil
+	return searchResp, nil
 }
 
 // genAuthorization 用于生成请求签名。

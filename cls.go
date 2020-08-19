@@ -269,7 +269,7 @@ func (p *LogService) searchWithContext(ctx context.Context, searchReq SearchReq)
 	v.Set("topic_ids", strings.Join(searchReq.TopicIDs, ","))
 	v.Set("start_time", searchReq.StartTime.Format(timeLayout))
 	v.Set("end_time", searchReq.EndTime.Format(timeLayout))
-	v.Set("query", searchReq.Query)
+	v.Set("query_string", searchReq.Query)
 	v.Set("limit", strconv.Itoa(searchReq.Limit))
 	if searchReq.Context != "" {
 		v.Set("context", searchReq.Context)
